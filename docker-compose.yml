@@ -1,0 +1,69 @@
+version: "3.8"
+
+# Docker Compose for local GHL-ERPNext development
+# This sets up ERPNext for local testing
+
+services:
+  # ERPNext with Frappe
+  erpnext:
+    image: frappe/erpnext:v15
+    container_name: ghl-erpnext
+    ports:
+      - "8000:8000"
+    environment:
+      - FRAPPE_SITE_NAME_HEADER=localhost
+    volumes:
+      - erpnext-sites:/home/frappe/frappe-bench/sites
+      - erpnext-logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      - mariadb
+      - redis-cache
+      - redis-queue
+    networks:
+      - ghl-network
+
+  # MariaDB Database
+  mariadb:
+    image: mariadb:10.6
+    container_name: ghl-mariadb
+    environment:
+      - MYSQL_ROOT_PASSWORD=admin
+      - MYSQL_DATABASE=erpnext
+      - MYSQL_USER=erpnext
+      - MYSQL_PASSWORD=erpnext
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    networks:
+      - ghl-network
+
+  # Redis for caching
+  redis-cache:
+    image: redis:7-alpine
+    container_name: ghl-redis-cache
+    networks:
+      - ghl-network
+
+  # Redis for queue
+  redis-queue:
+    image: redis:7-alpine
+    container_name: ghl-redis-queue
+    networks:
+      - ghl-network
+
+  # Redis for socketio (real-time)
+  redis-socketio:
+    image: redis:7-alpine
+    container_name: ghl-redis-socketio
+    networks:
+      - ghl-network
+
+networks:
+  ghl-network:
+    driver: bridge
+
+volumes:
+  erpnext-sites:
+  erpnext-logs:
+  mariadb-data:
