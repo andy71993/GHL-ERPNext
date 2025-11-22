@@ -564,6 +564,352 @@ docker-compose -f docker-compose.dev.yml up -d
 
 ---
 
+## Production Checklist
+
+Before deploying to production, implement these critical features:
+
+### 1. Security
+
+#### Webhook Signature Verification
+```typescript
+// apps/api/src/webhooks/webhooks.controller.ts
+import * as crypto from 'crypto';
+
+private verifyGhlSignature(payload: any, signature: string): boolean {
+  const expectedSignature = crypto
+    .createHmac('sha256', process.env.GHL_WEBHOOK_SECRET)
+    .update(JSON.stringify(payload))
+    .digest('hex');
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expectedSignature)
+  );
+}
+```
+
+#### Rate Limiting
+```bash
+pnpm add @nestjs/throttler
+```
+```typescript
+// app.module.ts
+import { ThrottlerModule } from '@nestjs/throttler';
+
+@Module({
+  imports: [
+    ThrottlerModule.forRoot([{
+      ttl: 60000,  // 1 minute
+      limit: 100,  // 100 requests per minute
+    }]),
+  ],
+})
+```
+
+#### CORS Configuration
+```typescript
+// main.ts - restrict to your domains
+app.enableCors({
+  origin: [
+    'https://your-app.com',
+    'https://app.gohighlevel.com',
+  ],
+  credentials: true,
+});
+```
+
+#### Helmet Security Headers
+```bash
+pnpm add helmet
+```
+```typescript
+import helmet from 'helmet';
+app.use(helmet());
+```
+
+### 2. Message Queue (Reliable Webhook Processing)
+
+```bash
+pnpm add @nestjs/bullmq bullmq
+```
+
+```typescript
+// webhooks/webhooks.processor.ts
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { Job } from 'bullmq';
+
+@Processor('ghl-webhooks')
+export class WebhooksProcessor extends WorkerHost {
+  async process(job: Job<GhlWebhookPayload>) {
+    const { type, data } = job.data;
+
+    switch (type) {
+      case 'ContactCreated':
+        await this.syncContact(data);
+        break;
+      // ... handle other events
+    }
+  }
+}
+
+// webhooks.controller.ts - queue instead of direct processing
+@Post('ghl')
+async handleWebhook(@Body() payload: GhlWebhookPayload) {
+  await this.webhookQueue.add('process', payload, {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 1000 },
+  });
+  return { received: true };
+}
+```
+
+### 3. Database for Tenant Management
+
+```bash
+pnpm add @prisma/client prisma
+```
+
+```prisma
+// prisma/schema.prisma
+model Tenant {
+  id              String   @id @default(uuid())
+  ghlLocationId   String   @unique
+  ghlAccessToken  String   // encrypted
+  ghlRefreshToken String   // encrypted
+  erpnextCompany  String
+  erpnextUrl      String?  // if using separate ERPNext instances
+  stripeCustomerId String?
+  subscriptionStatus String @default("trial")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model WebhookLog {
+  id        String   @id @default(uuid())
+  tenantId  String
+  eventType String
+  payload   Json
+  status    String   // pending, processed, failed
+  error     String?
+  createdAt DateTime @default(now())
+}
+```
+
+### 4. Error Handling & Logging
+
+```bash
+pnpm add @nestjs/terminus winston nest-winston
+```
+
+```typescript
+// common/filters/http-exception.filter.ts
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  constructor(private readonly logger: Logger) {}
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse();
+    const request = ctx.getRequest();
+
+    const status = exception instanceof HttpException
+      ? exception.getStatus()
+      : HttpStatus.INTERNAL_SERVER_ERROR;
+
+    this.logger.error({
+      statusCode: status,
+      path: request.url,
+      method: request.method,
+      message: exception instanceof Error ? exception.message : 'Unknown error',
+      stack: exception instanceof Error ? exception.stack : undefined,
+    });
+
+    response.status(status).json({
+      statusCode: status,
+      timestamp: new Date().toISOString(),
+      path: request.url,
+      message: 'An error occurred',
+    });
+  }
+}
+```
+
+### 5. Monitoring & Observability
+
+```typescript
+// Health checks with detailed status
+@Get('health/detailed')
+async detailedHealth() {
+  const [erpnext, ghl, redis, db] = await Promise.allSettled([
+    this.erpnextService.checkConnection(),
+    this.ghlService.checkConnection(),
+    this.redis.ping(),
+    this.prisma.$queryRaw`SELECT 1`,
+  ]);
+
+  return {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    services: {
+      erpnext: erpnext.status === 'fulfilled' && erpnext.value,
+      ghl: ghl.status === 'fulfilled' && ghl.value,
+      redis: redis.status === 'fulfilled',
+      database: db.status === 'fulfilled',
+    },
+  };
+}
+```
+
+Consider adding:
+- **Sentry** for error tracking
+- **Datadog/New Relic** for APM
+- **Prometheus + Grafana** for metrics
+
+### 6. Token Refresh Handling
+
+```typescript
+// ghl.service.ts - auto-refresh expired tokens
+async makeAuthenticatedRequest(tenantId: string, requestFn: () => Promise<any>) {
+  try {
+    return await requestFn();
+  } catch (error) {
+    if (error.response?.status === 401) {
+      // Token expired, refresh it
+      const tenant = await this.tenantService.get(tenantId);
+      const newTokens = await this.authService.refreshToken(tenant.ghlRefreshToken);
+      await this.tenantService.updateTokens(tenantId, newTokens);
+
+      // Retry the request
+      return await requestFn();
+    }
+    throw error;
+  }
+}
+```
+
+### 7. Environment Variables (Production)
+
+```env
+# Application
+NODE_ENV=production
+PORT=3001
+FRONTEND_URL=https://your-app.com
+
+# Security
+JWT_SECRET=use-a-strong-random-secret-min-32-chars
+ENCRYPTION_KEY=32-char-key-for-encrypting-tokens
+GHL_WEBHOOK_SECRET=your-webhook-secret
+
+# GHL OAuth (Marketplace)
+GHL_CLIENT_ID=your_client_id
+GHL_CLIENT_SECRET=your_client_secret
+GHL_REDIRECT_URI=https://your-api.com/auth/ghl/callback
+
+# ERPNext
+ERPNEXT_URL=https://your-site.frappe.cloud
+ERPNEXT_API_KEY=your_api_key
+ERPNEXT_API_SECRET=your_api_secret
+
+# Database (for tenant management)
+DATABASE_URL=postgresql://user:pass@host:5432/ghl_erpnext
+
+# Redis (for queues & caching)
+REDIS_URL=redis://localhost:6379
+
+# Stripe (billing)
+STRIPE_SECRET_KEY=sk_live_xxx
+STRIPE_WEBHOOK_SECRET=whsec_xxx
+STRIPE_PRICE_ID_BASIC=price_xxx
+STRIPE_PRICE_ID_PRO=price_xxx
+
+# Monitoring (optional)
+SENTRY_DSN=https://xxx@sentry.io/xxx
+```
+
+### 8. Pre-Launch Checklist
+
+- [ ] Webhook signature verification implemented
+- [ ] Rate limiting configured
+- [ ] CORS restricted to allowed origins
+- [ ] Helmet security headers enabled
+- [ ] Message queue for webhook processing
+- [ ] Database migrations run
+- [ ] Token refresh logic implemented
+- [ ] Error tracking (Sentry) configured
+- [ ] Health check endpoints working
+- [ ] SSL/TLS configured
+- [ ] Environment variables secured
+- [ ] Backup strategy for database
+- [ ] Monitoring/alerting set up
+- [ ] Load testing completed
+- [ ] Security audit completed
+
+---
+
+## Testing Guide
+
+### Quick Test (No ERPNext Required)
+
+Test the API structure and frontend without external dependencies:
+
+```bash
+# 1. Install dependencies
+pnpm install
+
+# 2. Start API (will show connection errors but endpoints work)
+cd apps/api && pnpm dev
+
+# 3. In another terminal, start frontend
+cd apps/web && pnpm dev
+
+# 4. Test health endpoint
+curl http://localhost:3001/api/health
+
+# 5. View Swagger docs
+open http://localhost:3001/docs
+
+# 6. View frontend
+open http://localhost:5173
+```
+
+### Full Integration Test
+
+```bash
+# 1. Start ERPNext locally
+./scripts/setup-erpnext.sh
+
+# 2. Wait for ERPNext to be ready (check http://localhost:8000)
+
+# 3. Configure .env with ERPNext credentials
+
+# 4. Test ERPNext connection
+curl http://localhost:3001/api/erpnext/status
+
+# 5. Test GHL connection (requires valid API key)
+curl http://localhost:3001/api/ghl/status
+
+# 6. Test webhook endpoint
+curl -X POST http://localhost:3001/api/webhooks/test \
+  -H "Content-Type: application/json" \
+  -d '{"type": "ContactCreated", "id": "test123"}'
+```
+
+### Testing Webhooks Locally
+
+Use ngrok to expose your local API:
+
+```bash
+# Install ngrok
+brew install ngrok  # or download from ngrok.com
+
+# Expose local API
+ngrok http 3001
+
+# Use the ngrok URL in GHL webhook settings
+# https://xxxx.ngrok.io/api/webhooks/ghl
+```
+
+---
+
 ## Resources
 
 - [ERPNext Documentation](https://docs.erpnext.com/)
